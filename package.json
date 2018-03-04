@@ -1,7 +1,7 @@
 {
   "name": "aws-stack-serverless-gatsby",
   "description": "Cloudformation configuration for a serverless hosted gatsby static website and serverless CI",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "author": "Manuel Schoebel <mail@manuel-schoebel.com>",
   "dependencies": {
   },

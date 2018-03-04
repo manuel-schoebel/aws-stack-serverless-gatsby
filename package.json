@@ -1,0 +1,22 @@
+{
+  "name": "aws-stack-serverless-gatsby",
+  "description": "Cloudformation configuration for a serverless hosted gatsby static website and serverless CI",
+  "version": "1.0.0",
+  "author": "Manuel Schoebel <mail@manuel-schoebel.com>",
+  "dependencies": {
+  },
+  "keywords": [
+    "gatsby",
+    "AWS",
+    "serverless"
+  ],
+  "license": "MIT",
+  "main": "n/a",
+  "scripts": {
+    "stack:create": "export $(cat config.env | xargs) && ./bin/create-stack.sh",
+    "stack:delete": "export $(cat config.env | xargs) && ./bin/delete-stack.sh",
+    "stack:update": "export $(cat config.env | xargs) && ./bin/update-stack.sh"
+  },
+  "devDependencies": {
+  }
+}

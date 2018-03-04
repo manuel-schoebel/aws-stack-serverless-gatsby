@@ -1,0 +1,389 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "Create stack for hosting a gatsby rendered website"
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: "Domain without www"
+    MinLength: 4
+    MaxLength: 253
+    AllowedPattern: "[a-z0-9]+[-.a-z0-9]*(\\.[a-z][a-z]+)+"
+    ConstraintDescription: "Provide a valid domain name using only lowercase letters, numbers, and dash (-)"
+
+  CertificateArn:
+    Type: String
+    Description: "Provide cert created within us-east-1 region - unfortunately it has to be there because Cloudfront is only within that region."
+    MinLength: 2
+    ConstraintDescription: "Provice a valie cert arn created within use-east-1"
+    
+  DefaultTTL:
+    Type: Number
+    Description: "TTL in seconds"
+    Default: 30
+
+  MinimumTTL:
+    Description: "Minimum cache lifetime in seconds for the CloudFront distribution"
+    Default: 5
+    Type: Number
+
+Resources:
+   
+  #### S3 BUCKETS
+  # Bucket for CloudFront and S3 access logs: logs.example.com
+  LogsBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "logs.${DomainName}"
+      AccessControl: LogDeliveryWrite
+    DeletionPolicy: Delete
+
+  # Bucket for site content: www.example.com
+  SiteBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "www.${DomainName}"
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: 404.html
+    DeletionPolicy: Delete
+
+  # Bucket to redirect to www.example.com: example.com
+  RedirectBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref DomainName
+      AccessControl: BucketOwnerFullControl
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Sub "www.${DomainName}"
+          Protocol: https
+    DeletionPolicy: Delete
+
+  # Bucket for CodePipeline artifact storage: codepipeline.example.com
+  CodePipelineBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "codepipeline.${DomainName}"
+      VersioningConfiguration:
+        Status: Enabled
+    DeletionPolicy: Delete
+
+  #### DEVELOPMENT
+  CodeCommit:
+    Type: "AWS::CodeCommit::Repository"
+    Properties: 
+      RepositoryDescription: !Sub "Git Repository for ${DomainName}"
+      RepositoryName: !Ref DomainName
+
+  #### BUILD
+  SourceEvent:
+    Properties:
+      Description: Rule for Amazon CloudWatch Events to detect changes to the source repository and trigger pipeline execution
+      EventPattern:
+        detail:
+          event: [referenceCreated, referenceUpdated]
+          referenceName: [master]
+          referenceType: [branch]
+        detail-type: [CodeCommit Repository State Change]
+        resources: [!GetAtt 'CodeCommit.Arn']
+        source: [aws.codecommit]
+      Name: !Join ['-', [!Ref 'AWS::StackName', SourceEvent]]
+      State: ENABLED
+      Targets: [{
+        Arn: !Join [':', [arn, aws, codepipeline, !Ref 'AWS::Region', !Ref 'AWS::AccountId', !Sub "${AWS::StackName}-codepipeline"]],
+        Id: ProjectPipelineTarget,
+        RoleArn: !GetAtt 'SourceEventRole.Arn'
+      }]
+    Type: AWS::Events::Rule
+  
+  SourceEventRole:
+    Description: IAM role to allow Amazon CloudWatch Events to trigger AWS CodePipeline execution
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Action: 'sts:AssumeRole', Effect: Allow, Principal: {Service: [events.amazonaws.com]}, Sid: 1}]
+      Policies: [{
+        PolicyDocument: {
+          Statement: [{
+            Action: ['codepipeline:StartPipelineExecution'],
+            Effect: Allow, 
+            Resource: [!Join [':', [arn, aws, codepipeline, !Ref 'AWS::Region',!Ref 'AWS::AccountId', !Sub "${AWS::StackName}-codepipeline"]]]
+          }]
+        },
+        PolicyName: !Sub "${AWS::StackName}CloudWatchEventPolicy"
+      }]
+    Type: AWS::IAM::Role
+
+  GatsbyCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  GatsbyCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:6.3.1
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: DESTINATION_S3_BUCKET
+            Value: !Sub "www.${DomainName}"
+      Name: !Sub "${AWS::StackName}-codebuild"
+      ServiceRole: !Ref GatsbyCodeBuildRole
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - touch .npmignore
+                - npm install -g gatsby
+            pre_build:
+              commands:
+                - npm install
+            build:
+              commands:
+                - npm run build
+            post_build:
+              commands:
+                - aws s3 sync "public/" "s3://$DESTINATION_S3_BUCKET" --delete --acl "public-read"
+          artifacts:
+            base-directory: public
+            files:
+              - "**/*"
+
+  #### DEPLOY
+  # IAM info for CodePipeline
+  CodePipelineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: "codepipeline.amazonaws.com"
+          Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # CodePipeline: Pass Git contents to AWS Lambda function on Git activity
+  CodePipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      Name: !Sub "${AWS::StackName}-codepipeline"
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineBucket
+      RestartExecutionOnUpdate: false
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${CodePipelineRole}"
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                RepositoryName: !Ref DomainName
+                BranchName: master
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SiteSource
+              RunOrder: 1
+        - Name: Build-and-Deploy
+          Actions:
+            - Name: Gatsby-Build
+              InputArtifacts:
+                - Name: SiteSource
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref GatsbyCodeBuild
+              OutputArtifacts:
+                - Name: StaticFiles
+              RunOrder: 1
+
+  #### RUN
+  # Certificate for HTTPS accesss through CloudFront
+  # !!! Created manually since it has to be created within us-east-1 !!!
+
+  # CDN serves S3 content over HTTPS for www.example.com
+  CloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Aliases:
+          - !Sub "www.${DomainName}"
+        PriceClass: PriceClass_100 # Use Only US, Canada and Europe
+        Origins:
+          -
+            DomainName: !Join ["", [
+              !Sub "www.${DomainName}", ".", 
+              !FindInMap [RegionMap, !Ref "AWS::Region", websiteendpoint]
+            ]]
+            Id: S3Origin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          AllowedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          DefaultTTL: !Ref DefaultTTL
+          MinTTL: !Ref MinimumTTL
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        # logs.example.com/logs/cloudfront/www.example.com/
+        Logging:
+          Bucket: !Join ["", [!Ref LogsBucket, ".s3.amazonaws.com"]]
+          Prefix: !Sub "logs/cloudfront/www.${DomainName}/"
+          IncludeCookies: false
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+
+  # CDN serves S3 content over HTTPS for example.com
+  RedirectCloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Aliases:
+          - !Ref RedirectBucket
+        PriceClass: PriceClass_100 # Use Only US, Canada and Europe
+        Origins:
+          -
+            DomainName: !Join ["", [!Ref RedirectBucket, ".", !FindInMap [RegionMap, !Ref "AWS::Region", websiteendpoint]]]
+            Id: RedirectS3Origin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: RedirectS3Origin
+          AllowedMethods:
+            - GET
+            - HEAD
+          DefaultTTL: !Ref DefaultTTL
+          MinTTL: !Ref MinimumTTL
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+             Forward: none
+          ViewerProtocolPolicy: allow-all
+        # logs.example.com/logs/cloudfront/example.com/
+        Logging:
+          Bucket: !Join ["", [!Ref LogsBucket, ".s3.amazonaws.com"]]
+          Prefix: !Sub "logs/cloudfront/${DomainName}/"
+          IncludeCookies: false
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+
+  # DNS: example.com, www.example.com
+  Route53HostedZone:
+    Type: "AWS::Route53::HostedZone"
+    Properties:
+      HostedZoneConfig:
+        Comment: !Sub "Created by CloudFormation stack: ${AWS::StackName}"
+      Name: !Ref DomainName
+    DeletionPolicy: Delete
+  
+  Route53RecordSetGroup:
+    Type: "AWS::Route53::RecordSetGroup"
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      HostedZoneName: !Ref "AWS::NoValue"
+      RecordSets:
+        # example.com
+        - Name: !Sub "${DomainName}."
+          Type: A
+          # Resolve to CloudFront distribution
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront
+            DNSName: !GetAtt RedirectCloudFrontDistribution.DomainName
+        # www.example.com
+        - Name: !Sub "www.${DomainName}."
+          Type: A
+          # Resolve to CloudFront distribution
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront
+            DNSName: !GetAtt CloudFrontDistribution.DomainName
+
+Outputs:
+  DomainName:
+    Description: Domain name
+    Value: !Ref DomainName
+  SiteBucket:
+    Value: !Ref SiteBucket
+  RedirectBucket:
+    Value: !Ref RedirectBucket
+
+Mappings:
+  RegionMap:
+    ap-northeast-1:
+      S3hostedzoneID: "Z2M4EHUR26P7ZW"
+      websiteendpoint: "s3-website-ap-northeast-1.amazonaws.com"
+    ap-northeast-2:
+      S3hostedzoneID: "Z3W03O7B5YMIYP"
+      websiteendpoint: "s3-website.ap-northeast-2.amazonaws.com"
+    ap-south-1:
+      S3hostedzoneID: "Z11RGJOFQNVJUP"
+      websiteendpoint: "s3-website.ap-south-1.amazonaws.com"
+    ap-southeast-1:
+      S3hostedzoneID: "Z3O0J2DXBE1FTB"
+      websiteendpoint: "s3-website-ap-southeast-1.amazonaws.com"
+    ap-southeast-2:
+      S3hostedzoneID: "Z1WCIGYICN2BYD"
+      websiteendpoint: "s3-website-ap-southeast-2.amazonaws.com"
+    eu-central-1:
+      S3hostedzoneID: "Z21DNDUVLTQW6Q"
+      websiteendpoint: "s3-website.eu-central-1.amazonaws.com"
+    eu-west-1:
+      S3hostedzoneID: "Z1BKCTXD74EZPE"
+      websiteendpoint: "s3-website-eu-west-1.amazonaws.com"
+    sa-east-1:
+      S3hostedzoneID: "Z7KQH4QJS55SO"
+      websiteendpoint: "s3-website-sa-east-1.amazonaws.com"
+    us-east-1:
+      S3hostedzoneID: "Z3AQBSTGFYJSTF"
+      websiteendpoint: "s3-website-us-east-1.amazonaws.com"
+    us-east-2:
+      S3hostedzoneID: "Z2O1EMRO9K5GLX"
+      websiteendpoint: "s3-website.us-east-2.amazonaws.com"
+    us-west-1:
+      S3hostedzoneID: "Z2F56UZL2M1ACD"
+      websiteendpoint: "s3-website-us-west-1.amazonaws.com"
+    us-west-2:
+      S3hostedzoneID: "Z3BJ6K6RIION7M"
+      websiteendpoint: "s3-website-us-west-2.amazonaws.com"
+
+
+# Metadata:
